@@ -280,8 +280,6 @@ TEST_F(HostCoreTest, NonArrayStatsIsRejected)
     EXPECT_TRUE(core.allStats().empty());
 }
 
-} // namespace
-
 // The third answer the enum exists for. A bool could not express it, which is
 // why this parameter stopped being one.
 TEST_F(HostCoreTest, BestEffortOptionalReachesTheCApi)
@@ -324,14 +322,16 @@ TEST_F(HostCoreTest, OptionalDependenciesAreReachable)
 // key. Present-and-null goes on to `get<double>()` and throws type_error.302,
 // and a host polling this on a timer has nothing on the path that catches it.
 
+// The unmeasurable in-process entry, verbatim from
+// logos-liblogos/src/logos_core/module_stats_json.cpp.
+constexpr const char* kUnmeasurableEntry =
+    R"([{"name":"alpha","pid":-1,"cpu_percent":null,)"
+    R"("cpu_time_seconds":null,"memory_mb":null,)"
+    R"("scope":"in_process","memory_kind":null}])";
+
 TEST_F(HostCoreTest, NullFiguresDoNotThrow)
 {
-    // The unmeasurable in-process entry, verbatim from
-    // logos-liblogos/src/logos_core/module_stats_json.cpp.
-    stub.statsJson =
-        R"([{"name":"alpha","pid":-1,"cpu_percent":null,)"
-        R"("cpu_time_seconds":null,"memory_mb":null,)"
-        R"("scope":"in_process","memory_kind":null}])";
+    stub.statsJson = kUnmeasurableEntry;
     LogosCore core(0, nullptr, emptyConfig());
 
     std::vector<logos::host::ModuleStats> all;
@@ -342,10 +342,7 @@ TEST_F(HostCoreTest, NullFiguresDoNotThrow)
 
 TEST_F(HostCoreTest, NullFigureIsNoReadingRatherThanZero)
 {
-    stub.statsJson =
-        R"([{"name":"alpha","pid":-1,"cpu_percent":null,)"
-        R"("cpu_time_seconds":null,"memory_mb":null,)"
-        R"("scope":"in_process","memory_kind":null}])";
+    stub.statsJson = kUnmeasurableEntry;
     LogosCore core(0, nullptr, emptyConfig());
 
     const auto s = core.stats("alpha");
@@ -424,3 +421,5 @@ TEST_F(HostCoreTest, ANullNameDoesNotThrowEither)
     ASSERT_TRUE(all[1].memoryMb.has_value());
     EXPECT_DOUBLE_EQ(*all[1].memoryMb, 8.0);
 }
+
+} // namespace

@@ -121,10 +121,7 @@ namespace host {
 // so `nullopt` here is a value a host must expect and not an error path.
 //
 // These were plain `double`s defaulting to 0.0, which collapsed the producer's
-// two answers into the one it went out of its way not to give — and the read
-// that produced them (`json::value(key, 0.0)`) defaulted only for an ABSENT
-// key, so on a present null it threw type_error.302 through a host's polling
-// timer instead.
+// two answers into the one it went out of its way not to give.
 struct ModuleStats {
     std::string name;
     std::optional<double> cpuPercent;
@@ -173,8 +170,10 @@ inline std::optional<std::string> drainCString(char* s)
 // THREE WAYS TO HAVE NO READING, and they are one answer here: the key is
 // absent, the key is present and null (the documented shape for a module
 // nobody could measure), or the key holds something that is not a number.
-// `json::value(key, 0.0)` covered only the first, turned the second into a
-// type_error.302 throw, and would turn the third into one too.
+//
+// TESTED, NOT DEFAULTED, because `json::value(key, 0.0)` covers only the first:
+// on the other two it goes on to `get<double>()` and throws type_error.302 —
+// out of a host's polling timer, which has nothing on the path that catches.
 //
 // `is_number()`, not `is_number_float()`: nlohmann parses `0` and `12` as
 // number_integer, and those are real readings.
@@ -186,16 +185,16 @@ inline std::optional<double> number(const nlohmann::json& entry, const char* key
 }
 
 // A string field out of a stats entry, empty when the producer gave none.
+// Tested rather than defaulted for the reason `number()` gives, one line up
+// from the figures: a present-and-null `name` would throw type_error.302 out
+// of the same loop, and the producer's merge leaves an entry whose `name` is
+// not a string in the array rather than dropping it (logos-liblogos
+// src/logos_core/module_stats_json.cpp), so that is reachable through the same
+// poll.
+//
 // Named `text` rather than `string`: this namespace spells `std::string`
 // constantly, and a function called `string` sitting in it is a trap for the
 // next unqualified use.
-//
-// Same trap, one line up from the figures: `json::value(key, std::string{})`
-// substitutes the default only for an ABSENT key, so a present-and-null `name`
-// throws type_error.302 out of the same loop. The producer's merge leaves an
-// entry whose `name` is not a string in the array rather than dropping it
-// (logos-liblogos src/logos_core/module_stats_json.cpp), so this is reachable
-// through the same poll.
 inline std::string text(const nlohmann::json& entry, const char* key)
 {
     const auto it = entry.find(key);
@@ -393,13 +392,9 @@ public:
             // name, cpu_percent, cpu_time_seconds, memory_mb. This read "cpu"
             // and "memory", which are emitted by nothing, so every host that
             // adopted this façade would have silently reported 0 for both.
-            //
-            // TESTED, NOT DEFAULTED. `json::value(key, 0.0)` substitutes the
-            // default only for an ABSENT key; on a key that is present and
-            // null it goes on to `get<double>()` and throws type_error.302 —
-            // and null is precisely what the producer documents for a module
-            // nobody could measure. A host polls this on a timer with nothing
-            // on the path that catches, so that throw terminated it.
+            // `detail::number` TESTS each key rather than defaulting it,
+            // because null — what the producer emits for a module nobody could
+            // measure — is not an absent key; see there.
             s.cpuPercent     = detail::number(entry, "cpu_percent");
             s.cpuTimeSeconds = detail::number(entry, "cpu_time_seconds");
             s.memoryMb       = detail::number(entry, "memory_mb");
