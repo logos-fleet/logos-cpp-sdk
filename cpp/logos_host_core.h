@@ -112,15 +112,28 @@ namespace host {
 
 // One loaded module's resource usage, indexed out of the single blob that
 // logos_core_get_module_stats() returns for ALL modules.
+//
+// EVERY FIGURE IS OPTIONAL, because the producer's contract makes it so.
+// `logos_core_get_module_stats()` (logos-liblogos src/logos_core/logos_core.h)
+// emits NULL — not 0 — for a module nobody could account for: "absent and idle
+// are different answers". A container with no way to measure its modules (a
+// `web` module whose view has no process, pid -1) reports exactly that shape,
+// so `nullopt` here is a value a host must expect and not an error path.
+//
+// These were plain `double`s defaulting to 0.0, which collapsed the producer's
+// two answers into the one it went out of its way not to give — and the read
+// that produced them (`json::value(key, 0.0)`) defaulted only for an ABSENT
+// key, so on a present null it threw type_error.302 through a host's polling
+// timer instead.
 struct ModuleStats {
     std::string name;
-    double      cpuPercent = 0.0;
-    double      cpuTimeSeconds = 0.0;
+    std::optional<double> cpuPercent;
+    std::optional<double> cpuTimeSeconds;
     // MEGABYTES, not bytes — that is what the producer emits
     // (process-stats/src/process_stats.h: `double memoryMB`). This member was
     // `long long memoryBytes` and read a key that does not exist, so it was
     // both the wrong unit and always zero.
-    double      memoryMb = 0.0;
+    std::optional<double> memoryMb;
     // The raw entry, so a host can read fields this struct does not model
     // without waiting for the SDK to grow them.
     nlohmann::json raw;
@@ -152,6 +165,42 @@ inline std::optional<std::string> drainCString(char* s)
     std::optional<std::string> out(std::string{s});
     delete[] s;
     return out;
+}
+
+// One figure out of a stats entry, or nullopt when the producer gave no
+// reading for it.
+//
+// THREE WAYS TO HAVE NO READING, and they are one answer here: the key is
+// absent, the key is present and null (the documented shape for a module
+// nobody could measure), or the key holds something that is not a number.
+// `json::value(key, 0.0)` covered only the first, turned the second into a
+// type_error.302 throw, and would turn the third into one too.
+//
+// `is_number()`, not `is_number_float()`: nlohmann parses `0` and `12` as
+// number_integer, and those are real readings.
+inline std::optional<double> number(const nlohmann::json& entry, const char* key)
+{
+    const auto it = entry.find(key);
+    if (it == entry.end() || !it->is_number()) return std::nullopt;
+    return it->get<double>();
+}
+
+// A string field out of a stats entry, empty when the producer gave none.
+// Named `text` rather than `string`: this namespace spells `std::string`
+// constantly, and a function called `string` sitting in it is a trap for the
+// next unqualified use.
+//
+// Same trap, one line up from the figures: `json::value(key, std::string{})`
+// substitutes the default only for an ABSENT key, so a present-and-null `name`
+// throws type_error.302 out of the same loop. The producer's merge leaves an
+// entry whose `name` is not a string in the array rather than dropping it
+// (logos-liblogos src/logos_core/module_stats_json.cpp), so this is reachable
+// through the same poll.
+inline std::string text(const nlohmann::json& entry, const char* key)
+{
+    const auto it = entry.find(key);
+    if (it == entry.end() || !it->is_string()) return std::string{};
+    return it->get<std::string>();
 }
 
 } // namespace detail
@@ -339,14 +388,21 @@ public:
         for (const nlohmann::json& entry : parsed) {
             if (!entry.is_object()) continue;
             ModuleStats s;
-            s.name = entry.value("name", std::string{});
+            s.name = detail::text(entry, "name");
             // Key names are process-stats' (src/process_stats.cpp:157-161):
             // name, cpu_percent, cpu_time_seconds, memory_mb. This read "cpu"
             // and "memory", which are emitted by nothing, so every host that
             // adopted this façade would have silently reported 0 for both.
-            s.cpuPercent     = entry.value("cpu_percent", 0.0);
-            s.cpuTimeSeconds = entry.value("cpu_time_seconds", 0.0);
-            s.memoryMb       = entry.value("memory_mb", 0.0);
+            //
+            // TESTED, NOT DEFAULTED. `json::value(key, 0.0)` substitutes the
+            // default only for an ABSENT key; on a key that is present and
+            // null it goes on to `get<double>()` and throws type_error.302 —
+            // and null is precisely what the producer documents for a module
+            // nobody could measure. A host polls this on a timer with nothing
+            // on the path that catches, so that throw terminated it.
+            s.cpuPercent     = detail::number(entry, "cpu_percent");
+            s.cpuTimeSeconds = detail::number(entry, "cpu_time_seconds");
+            s.memoryMb       = detail::number(entry, "memory_mb");
             s.raw = entry;
             out.push_back(std::move(s));
         }
