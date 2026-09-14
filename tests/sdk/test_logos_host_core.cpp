@@ -239,9 +239,14 @@ TEST_F(HostCoreTest, StatsAreIndexedOutOfTheSingleBlob)
     const auto s = core.stats("alpha");
     ASSERT_TRUE(s.has_value());
     EXPECT_EQ(s->name, "alpha");
-    EXPECT_DOUBLE_EQ(s->cpuPercent, 12.5);
-    EXPECT_DOUBLE_EQ(s->memoryMb, 4096.0);
-    EXPECT_DOUBLE_EQ(s->cpuTimeSeconds, 3.5);
+    // A reported figure is engaged; the optional is what tells it apart from
+    // the null the producer emits for a module it could not measure.
+    ASSERT_TRUE(s->cpuPercent.has_value());
+    EXPECT_DOUBLE_EQ(*s->cpuPercent, 12.5);
+    ASSERT_TRUE(s->memoryMb.has_value());
+    EXPECT_DOUBLE_EQ(*s->memoryMb, 4096.0);
+    ASSERT_TRUE(s->cpuTimeSeconds.has_value());
+    EXPECT_DOUBLE_EQ(*s->cpuTimeSeconds, 3.5);
     EXPECT_EQ(s->raw["name"], "alpha") << "the raw entry stays reachable";
 }
 
@@ -275,8 +280,6 @@ TEST_F(HostCoreTest, NonArrayStatsIsRejected)
     EXPECT_TRUE(core.allStats().empty());
 }
 
-} // namespace
-
 // The third answer the enum exists for. A bool could not express it, which is
 // why this parameter stopped being one.
 TEST_F(HostCoreTest, BestEffortOptionalReachesTheCApi)
@@ -306,3 +309,117 @@ TEST_F(HostCoreTest, OptionalDependenciesAreReachable)
     EXPECT_EQ(core.optionalDependencies("alpha"),
               (std::vector<std::string>{"opt1", "opt2"}));
 }
+
+// ── stats: the NULL figures liblogos is documented to emit ──────────────────
+//
+// `logos_core_get_module_stats()`'s contract (logos-liblogos
+// src/logos_core/logos_core.h) is that a module NOBODY COULD MEASURE reports
+// its three figures as NULL — "NULL, never 0: absent and idle are different
+// answers". A container with no way to account for its modules (a `web`
+// module whose view has no process, pid -1) emits exactly that shape.
+//
+// `nlohmann::json::value(key, default)` returns the default only for an ABSENT
+// key. Present-and-null goes on to `get<double>()` and throws type_error.302,
+// and a host polling this on a timer has nothing on the path that catches it.
+
+// The unmeasurable in-process entry, verbatim from
+// logos-liblogos/src/logos_core/module_stats_json.cpp.
+constexpr const char* kUnmeasurableEntry =
+    R"([{"name":"alpha","pid":-1,"cpu_percent":null,)"
+    R"("cpu_time_seconds":null,"memory_mb":null,)"
+    R"("scope":"in_process","memory_kind":null}])";
+
+TEST_F(HostCoreTest, NullFiguresDoNotThrow)
+{
+    stub.statsJson = kUnmeasurableEntry;
+    LogosCore core(0, nullptr, emptyConfig());
+
+    std::vector<logos::host::ModuleStats> all;
+    ASSERT_NO_THROW(all = core.allStats());
+    ASSERT_EQ(all.size(), 1u);
+    EXPECT_EQ(all[0].name, "alpha");
+}
+
+TEST_F(HostCoreTest, NullFigureIsNoReadingRatherThanZero)
+{
+    stub.statsJson = kUnmeasurableEntry;
+    LogosCore core(0, nullptr, emptyConfig());
+
+    const auto s = core.stats("alpha");
+    ASSERT_TRUE(s.has_value());
+    // Zero is what a loaded, idle module reports. This module was never
+    // measured, and the struct has to be able to say so.
+    EXPECT_FALSE(s->cpuPercent.has_value());
+    EXPECT_FALSE(s->cpuTimeSeconds.has_value());
+    EXPECT_FALSE(s->memoryMb.has_value());
+    EXPECT_TRUE(s->raw["memory_kind"].is_null()) << "the raw entry stays reachable";
+}
+
+// A figure the producer spelled as something other than a number is no
+// reading either — not a 0 the host would render as an idle module.
+TEST_F(HostCoreTest, NonNumericFigureIsNoReading)
+{
+    stub.statsJson =
+        R"([{"name":"alpha","cpu_percent":"12.5","cpu_time_seconds":[],)"
+        R"("memory_mb":{}}])";
+    LogosCore core(0, nullptr, emptyConfig());
+
+    std::vector<logos::host::ModuleStats> all;
+    ASSERT_NO_THROW(all = core.allStats());
+    ASSERT_EQ(all.size(), 1u);
+    EXPECT_FALSE(all[0].cpuPercent.has_value());
+    EXPECT_FALSE(all[0].cpuTimeSeconds.has_value());
+    EXPECT_FALSE(all[0].memoryMb.has_value());
+}
+
+// An ABSENT key stays no reading too. This used to default to 0.0, which is
+// the same claim the null case was making.
+TEST_F(HostCoreTest, AbsentFigureIsNoReading)
+{
+    stub.statsJson = R"([{"name":"alpha"}])";
+    LogosCore core(0, nullptr, emptyConfig());
+
+    const auto s = core.stats("alpha");
+    ASSERT_TRUE(s.has_value());
+    EXPECT_FALSE(s->cpuPercent.has_value());
+    EXPECT_FALSE(s->memoryMb.has_value());
+}
+
+// An integral figure is still a figure: nlohmann keeps 0 / 12 as
+// number_integer, and `is_number_float()` alone would drop them.
+TEST_F(HostCoreTest, IntegralFigureIsARealReading)
+{
+    stub.statsJson =
+        R"([{"name":"alpha","cpu_percent":0,"cpu_time_seconds":3,"memory_mb":12}])";
+    LogosCore core(0, nullptr, emptyConfig());
+
+    const auto s = core.stats("alpha");
+    ASSERT_TRUE(s.has_value());
+    ASSERT_TRUE(s->cpuPercent.has_value());
+    EXPECT_DOUBLE_EQ(*s->cpuPercent, 0.0) << "a measured zero is a measurement";
+    ASSERT_TRUE(s->cpuTimeSeconds.has_value());
+    EXPECT_DOUBLE_EQ(*s->cpuTimeSeconds, 3.0);
+    ASSERT_TRUE(s->memoryMb.has_value());
+    EXPECT_DOUBLE_EQ(*s->memoryMb, 12.0);
+}
+
+// The same trap one line above the figures. liblogos' merge leaves an entry
+// whose `name` is not a string IN the array (module_stats_json.cpp skips it
+// for the scope stamp rather than dropping it), so a present-and-null `name`
+// reaches this parse through the same poll and used to throw out of it.
+TEST_F(HostCoreTest, ANullNameDoesNotThrowEither)
+{
+    stub.statsJson = R"([{"name":null,"cpu_percent":1.5},{"name":"beta","memory_mb":8.0}])";
+    LogosCore core(0, nullptr, emptyConfig());
+
+    std::vector<logos::host::ModuleStats> all;
+    ASSERT_NO_THROW(all = core.allStats());
+    ASSERT_EQ(all.size(), 2u);
+    EXPECT_TRUE(all[0].name.empty()) << "no name is the empty string, as an absent one always was";
+    // And the nameless entry does not cost us the named one beside it.
+    EXPECT_EQ(all[1].name, "beta");
+    ASSERT_TRUE(all[1].memoryMb.has_value());
+    EXPECT_DOUBLE_EQ(*all[1].memoryMb, 8.0);
+}
+
+} // namespace
